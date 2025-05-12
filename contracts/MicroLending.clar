@@ -398,3 +398,182 @@
 )
 
 
+
+
+
+
+(define-map insurance-pool
+    { pool-id: uint }
+    {
+        total-amount: uint,
+        coverage-ratio: uint,
+        active-policies: uint,
+        claims-paid: uint
+    }
+)
+
+(define-map loan-insurance
+    { loan-id: uint }
+    {
+        insured-amount: uint,
+        premium-paid: uint,
+        is-active: bool
+    }
+)
+
+(define-public (contribute-to-insurance-pool (amount uint))
+    (let
+        ((current-pool (default-to
+            { total-amount: u0, coverage-ratio: u50, active-policies: u0, claims-paid: u0 }
+            (map-get? insurance-pool { pool-id: u1 }))))
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (map-set insurance-pool
+            { pool-id: u1 }
+            {
+                total-amount: (+ (get total-amount current-pool) amount),
+                coverage-ratio: (get coverage-ratio current-pool),
+                active-policies: (get active-policies current-pool),
+                claims-paid: (get claims-paid current-pool)
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (insure-loan (loan-id uint) (coverage-amount uint))
+    (let
+        ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+         (premium (* coverage-amount u01)))
+        
+        (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+        
+        (map-set loan-insurance
+            { loan-id: loan-id }
+            {
+                insured-amount: coverage-amount,
+                premium-paid: premium,
+                is-active: true
+            }
+        )
+        (ok true)
+    )
+)
+
+
+(define-map loan-auctions
+    { auction-id: uint }
+    {
+        loan-id: uint,
+        min-rate: uint,
+        max-rate: uint,
+        best-bid: uint,
+        best-bidder: (optional principal),
+        end-height: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-data-var auction-counter uint u0)
+
+(define-public (create-loan-auction (loan-id uint) (min-rate uint) (max-rate uint) (duration uint))
+    (let
+        ((auction-id (+ (var-get auction-counter) u1))
+         (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+        
+        (asserts! (is-eq (get status loan) "REQUESTED") ERR-LOAN-NOT-ACTIVE)
+        (asserts! (is-eq (get borrower loan) tx-sender) ERR-NOT-AUTHORIZED)
+        
+        (map-set loan-auctions
+            { auction-id: auction-id }
+            {
+                loan-id: loan-id,
+                min-rate: min-rate,
+                max-rate: max-rate,
+                best-bid: max-rate,
+                best-bidder: none,
+                end-height: (+ stacks-block-height duration),
+                status: "ACTIVE"
+            }
+        )
+        
+        (var-set auction-counter auction-id)
+        (ok auction-id)
+    )
+)
+
+(define-public (place-bid (auction-id uint) (bid-rate uint))
+    (let
+        ((auction (unwrap! (map-get? loan-auctions { auction-id: auction-id }) ERR-LOAN-NOT-FOUND)))
+        
+        (asserts! (< bid-rate (get best-bid auction)) ERR-INVALID-AMOUNT)
+        (asserts! (>= bid-rate (get min-rate auction)) ERR-INVALID-AMOUNT)
+        (asserts! (< stacks-block-height (get end-height auction)) ERR-LOAN-NOT-ACTIVE)
+        
+        (map-set loan-auctions
+            { auction-id: auction-id }
+            (merge auction {
+                best-bid: bid-rate,
+                best-bidder: (some tx-sender)
+            })
+        )
+        (ok true)
+    )
+)
+
+
+(define-map payment-schedules
+    { loan-id: uint }
+    {
+        total-payments: uint,
+        payment-amount: uint,
+        payment-interval: uint,
+        payments-made: uint,
+        next-payment-height: uint
+    }
+)
+
+(define-public (create-payment-schedule (loan-id uint) (num-payments uint))
+    (let
+        ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+         (payment-amount (/ (get amount loan) num-payments))
+         (payment-interval (/ (get term-length loan) num-payments)))
+        
+        (asserts! (is-eq (get status loan) "ACTIVE") ERR-LOAN-NOT-ACTIVE)
+        (asserts! (> num-payments u0) ERR-INVALID-AMOUNT)
+        
+        (map-set payment-schedules
+            { loan-id: loan-id }
+            {
+                total-payments: num-payments,
+                payment-amount: payment-amount,
+                payment-interval: payment-interval,
+                payments-made: u0,
+                next-payment-height: (+ stacks-block-height payment-interval)
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (make-scheduled-payment (loan-id uint))
+    (let
+        ((schedule (unwrap! (map-get? payment-schedules { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+         (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+        
+        (asserts! (is-eq (get borrower loan) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (<= stacks-block-height (get next-payment-height schedule)) ERR-LOAN-NOT-ACTIVE)
+        
+        (try! (stx-transfer? (get payment-amount schedule) tx-sender (as-contract tx-sender)))
+        
+        (map-set payment-schedules
+            { loan-id: loan-id }
+            (merge schedule {
+                payments-made: (+ (get payments-made schedule) u1),
+                next-payment-height: (+ (get next-payment-height schedule) (get payment-interval schedule))
+            })
+        )
+        (ok true)
+    )
+)
