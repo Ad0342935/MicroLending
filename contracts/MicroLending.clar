@@ -577,3 +577,239 @@
         (ok true)
     )
 )
+
+(define-constant ERR-LOAN-DEFAULTED (err u109))
+(define-constant ERR-NOT-DEFAULTED (err u110))
+(define-constant ERR-ALREADY-LIQUIDATED (err u111))
+
+(define-data-var default-grace-period uint u1440)
+(define-data-var liquidation-penalty uint u10)
+
+(define-map loan-defaults
+    { loan-id: uint }
+    {
+        default-height: uint,
+        liquidated: bool,
+        liquidation-amount: uint,
+        penalty-applied: uint
+    }
+)
+
+(define-map platform-treasury
+    { treasury-id: uint }
+    { balance: uint }
+)
+
+(define-public (check-loan-default (loan-id uint))
+    (let
+        ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+         (schedule (map-get? payment-schedules { loan-id: loan-id })))
+        
+        (asserts! (is-eq (get status loan) "ACTIVE") ERR-LOAN-NOT-ACTIVE)
+        
+        (if (is-some schedule)
+            (let ((sched (unwrap-panic schedule)))
+                (if (and 
+                    (> stacks-block-height (+ (get next-payment-height sched) (var-get default-grace-period)))
+                    (< (get payments-made sched) (get total-payments sched)))
+                    (begin
+                        (try! (mark-loan-default loan-id))
+                        (ok true))
+                    (ok false)))
+            (if (> stacks-block-height (+ (+ (get start-height loan) (get term-length loan)) (var-get default-grace-period)))
+                (begin
+                    (try! (mark-loan-default loan-id))
+                    (ok true))
+                (ok false)))
+    )
+)
+
+(define-private (mark-loan-default (loan-id uint))
+    (let
+        ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+        
+        (map-set loans
+            { loan-id: loan-id }
+            (merge loan { status: "DEFAULTED" })
+        )
+        
+        (map-set loan-defaults
+            { loan-id: loan-id }
+            {
+                default-height: stacks-block-height,
+                liquidated: false,
+                liquidation-amount: u0,
+                penalty-applied: (/ (* (get collateral loan) (var-get liquidation-penalty)) u100)
+            }
+        )
+        
+        (update-credit-score-default (get borrower loan))
+        (ok true)
+    )
+)
+
+;; Helper function for min
+(define-private (min (a uint) (b uint))
+    (if (< a b) a b)
+)
+
+(define-public (liquidate-collateral (loan-id uint))
+    (let
+        ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+         (default-info (unwrap! (map-get? loan-defaults { loan-id: loan-id }) ERR-NOT-DEFAULTED))
+         (lender (unwrap! (get lender loan) ERR-LOAN-NOT-FOUND))
+         (remaining-debt (- (get amount loan) (get repaid-amount loan)))
+         (liquidation-amount (min (get collateral loan) remaining-debt))
+         (treasury-amount (- (get collateral loan) liquidation-amount)))
+        
+        (asserts! (is-eq (get status loan) "DEFAULTED") ERR-NOT-DEFAULTED)
+        (asserts! (not (get liquidated default-info)) ERR-ALREADY-LIQUIDATED)
+        
+        (if (> liquidation-amount u0)
+            (try! (as-contract (stx-transfer? liquidation-amount (as-contract tx-sender) lender)))
+            true)
+        
+        (if (> treasury-amount u0)
+            (begin
+                (unwrap! (add-to-treasury treasury-amount) (err u102))
+                true)
+            true)
+        
+        (map-set loan-defaults
+            { loan-id: loan-id }
+            (merge default-info {
+                liquidated: true,
+                liquidation-amount: liquidation-amount
+            })
+        )
+        
+        (map-set loans
+            { loan-id: loan-id }
+            (merge loan { status: "LIQUIDATED" })
+        )
+        
+        (ok liquidation-amount)
+    )
+)
+
+(define-public (recover-partial-default (loan-id uint) (recovery-amount uint))
+    (let
+        ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+         (default-info (unwrap! (map-get? loan-defaults { loan-id: loan-id }) ERR-NOT-DEFAULTED))
+         (remaining-debt (- (get amount loan) (get repaid-amount loan))))
+        
+        (asserts! (is-eq (get borrower loan) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status loan) "DEFAULTED") ERR-NOT-DEFAULTED)
+        (asserts! (not (get liquidated default-info)) ERR-ALREADY-LIQUIDATED)
+        (asserts! (<= recovery-amount remaining-debt) ERR-INVALID-AMOUNT)
+        
+        (try! (stx-transfer? recovery-amount tx-sender (as-contract tx-sender)))
+        
+        (let ((new-repaid (+ (get repaid-amount loan) recovery-amount)))
+            (map-set loans
+                { loan-id: loan-id }
+                (merge loan {
+                    repaid-amount: new-repaid,
+                    status: (if (>= new-repaid (get amount loan)) "COMPLETED" "DEFAULTED")
+                })
+            )
+        )
+        
+        (if (>= (+ (get repaid-amount loan) recovery-amount) (get amount loan))
+            (begin
+                (try! (as-contract (stx-transfer? (get collateral loan) (as-contract tx-sender) (get borrower loan))))
+                (update-credit-score-recovery tx-sender)
+                (ok true))
+            (ok true))
+    )
+)
+
+(define-private (add-to-treasury (amount uint))
+    (let
+        ((current-balance (default-to u0 (get balance (map-get? platform-treasury { treasury-id: u1 })))))
+        (map-set platform-treasury
+            { treasury-id: u1 }
+            { balance: (+ current-balance amount) }
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-credit-score-default (user principal))
+    (let
+        ((current-credit (default-to
+            { score: u0, loans-taken: u0, loans-repaid: u0 }
+            (map-get? user-credit-scores { user: user }))))
+        (map-set user-credit-scores
+            { user: user }
+            {
+                score: (if (>= (get score current-credit) u50) (- (get score current-credit) u50) u0),
+                loans-taken: (get loans-taken current-credit),
+                loans-repaid: (get loans-repaid current-credit)
+            }
+        )
+        true
+    )
+)
+
+(define-private (update-credit-score-recovery (user principal))
+    (let
+        ((current-credit (default-to
+            { score: u0, loans-taken: u0, loans-repaid: u0 }
+            (map-get? user-credit-scores { user: user }))))
+        (map-set user-credit-scores
+            { user: user }
+            {
+                score: (+ (get score current-credit) u25),
+                loans-taken: (get loans-taken current-credit),
+                loans-repaid: (+ (get loans-repaid current-credit) u1)
+            }
+        )
+        true
+    )
+)
+
+(define-public (set-default-parameters (grace-period uint) (penalty uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set default-grace-period grace-period)
+        (var-set liquidation-penalty penalty)
+        (ok true)
+    )
+)
+
+(define-read-only (get-loan-default-info (loan-id uint))
+    (map-get? loan-defaults { loan-id: loan-id })
+)
+
+(define-read-only (is-loan-overdue (loan-id uint))
+    (let
+        ((loan (map-get? loans { loan-id: loan-id }))
+         (schedule (map-get? payment-schedules { loan-id: loan-id })))
+        (if (and (is-some loan) (is-some schedule))
+            (let 
+                ((l (unwrap-panic loan))
+                 (s (unwrap-panic schedule)))
+                (and 
+                    (is-eq (get status l) "ACTIVE")
+                    (> stacks-block-height (get next-payment-height s))
+                    (< (get payments-made s) (get total-payments s))))
+            (if (is-some loan)
+                (let ((l (unwrap-panic loan)))
+                    (and
+                        (is-eq (get status l) "ACTIVE")
+                        (> stacks-block-height (+ (get start-height l) (get term-length l)))))
+                false))
+    )
+)
+
+(define-read-only (get-platform-treasury-balance)
+    (default-to u0 (get balance (map-get? platform-treasury { treasury-id: u1 })))
+)
+
+(define-read-only (get-default-parameters)
+    {
+        grace-period: (var-get default-grace-period),
+        liquidation-penalty: (var-get liquidation-penalty)
+    }
+)
