@@ -813,3 +813,312 @@
         liquidation-penalty: (var-get liquidation-penalty)
     }
 )
+
+(define-constant ERR-DISPUTE-EXISTS (err u112))
+(define-constant ERR-DISPUTE-NOT-FOUND (err u113))
+(define-constant ERR-INVALID-DISPUTE-TYPE (err u114))
+(define-constant ERR-VOTING-ENDED (err u115))
+(define-constant ERR-ALREADY-VOTED (err u116))
+(define-constant ERR-NOT-JURY-MEMBER (err u117))
+(define-constant ERR-DISPUTE-NOT-RESOLVED (err u118))
+(define-constant ERR-INSUFFICIENT-CREDIT (err u119))
+
+(define-data-var dispute-counter uint u0)
+(define-data-var dispute-fee uint u500000)
+(define-data-var voting-period uint u2016)
+(define-data-var jury-size uint u5)
+(define-data-var min-jury-credit uint u50)
+
+(define-map loan-disputes
+    { dispute-id: uint }
+    {
+        loan-id: uint,
+        initiator: principal,
+        respondent: principal,
+        dispute-type: (string-ascii 30),
+        description: (string-ascii 500),
+        status: (string-ascii 20),
+        voting-end-height: uint,
+        votes-for: uint,
+        votes-against: uint,
+        fee-paid: uint,
+        resolution: (string-ascii 20)
+    }
+)
+
+(define-map dispute-jury
+    { dispute-id: uint, juror: principal }
+    {
+        has-voted: bool,
+        vote: (string-ascii 20),
+        reward-claimed: bool
+    }
+)
+
+(define-map jury-pool
+    { juror: principal }
+    {
+        disputes-judged: uint,
+        reputation-score: uint,
+        total-rewards: uint,
+        is-active: bool
+    }
+)
+
+(define-public (create-loan-dispute (loan-id uint) (dispute-type (string-ascii 30)) (description (string-ascii 500)))
+    (let
+        ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+         (dispute-id (+ (var-get dispute-counter) u1))
+         (lender (unwrap! (get lender loan) ERR-LOAN-NOT-FOUND))
+         (borrower (get borrower loan))
+         (fee-amount (var-get dispute-fee)))
+        
+        (asserts! (is-none (get-active-dispute loan-id)) ERR-DISPUTE-EXISTS)
+        (asserts! (or (is-eq tx-sender borrower) (is-eq tx-sender lender)) ERR-NOT-AUTHORIZED)
+        (asserts! (or (is-eq dispute-type "PAYMENT_DISPUTE") 
+                      (is-eq dispute-type "COLLATERAL_DISPUTE")
+                      (is-eq dispute-type "TERMS_DISPUTE")
+                      (is-eq dispute-type "DEFAULT_DISPUTE")) ERR-INVALID-DISPUTE-TYPE)
+        
+        (try! (stx-transfer? fee-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set loan-disputes
+            { dispute-id: dispute-id }
+            {
+                loan-id: loan-id,
+                initiator: tx-sender,
+                respondent: (if (is-eq tx-sender borrower) lender borrower),
+                dispute-type: dispute-type,
+                description: description,
+                status: "PENDING",
+                voting-end-height: (+ stacks-block-height (var-get voting-period)),
+                votes-for: u0,
+                votes-against: u0,
+                fee-paid: fee-amount,
+                resolution: "NONE"
+            }
+        )
+        
+        (var-set dispute-counter dispute-id)
+        (unwrap! (select-jury-for-dispute dispute-id) (err u200))
+        (ok dispute-id)
+    )
+)
+
+(define-public (join-jury-pool)
+    (let
+        ((user-credit (default-to
+            { score: u0, loans-taken: u0, loans-repaid: u0 }
+            (map-get? user-credit-scores { user: tx-sender }))))
+        
+        (asserts! (>= (get score user-credit) (var-get min-jury-credit)) ERR-INSUFFICIENT-CREDIT)
+        
+        (map-set jury-pool
+            { juror: tx-sender }
+            {
+                disputes-judged: u0,
+                reputation-score: (get score user-credit),
+                total-rewards: u0,
+                is-active: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote (string-ascii 20)))
+    (let
+        ((dispute (unwrap! (map-get? loan-disputes { dispute-id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+         (jury-member (unwrap! (map-get? dispute-jury { dispute-id: dispute-id, juror: tx-sender }) ERR-NOT-JURY-MEMBER)))
+        
+        (asserts! (is-eq (get status dispute) "PENDING") ERR-DISPUTE-NOT-RESOLVED)
+        (asserts! (< stacks-block-height (get voting-end-height dispute)) ERR-VOTING-ENDED)
+        (asserts! (not (get has-voted jury-member)) ERR-ALREADY-VOTED)
+        (asserts! (or (is-eq vote "FOR") (is-eq vote "AGAINST")) ERR-INVALID-AMOUNT)
+        
+        (map-set dispute-jury
+            { dispute-id: dispute-id, juror: tx-sender }
+            (merge jury-member {
+                has-voted: true,
+                vote: vote
+            })
+        )
+        
+        (map-set loan-disputes
+            { dispute-id: dispute-id }
+            (merge dispute {
+                votes-for: (if (is-eq vote "FOR") (+ (get votes-for dispute) u1) (get votes-for dispute)),
+                votes-against: (if (is-eq vote "AGAINST") (+ (get votes-against dispute) u1) (get votes-against dispute))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let
+        ((dispute (unwrap! (map-get? loan-disputes { dispute-id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+         (total-votes (+ (get votes-for dispute) (get votes-against dispute))))
+        
+        (asserts! (is-eq (get status dispute) "PENDING") ERR-DISPUTE-NOT-RESOLVED)
+        (asserts! (>= stacks-block-height (get voting-end-height dispute)) ERR-VOTING-ENDED)
+        (asserts! (> total-votes u0) ERR-INVALID-AMOUNT)
+        
+        (let
+            ((resolution (if (> (get votes-for dispute) (get votes-against dispute)) "FAVOR_INITIATOR" "FAVOR_RESPONDENT"))
+             (jury-reward (/ (get fee-paid dispute) (var-get jury-size))))
+            
+            (map-set loan-disputes
+                { dispute-id: dispute-id }
+                (merge dispute {
+                    status: "RESOLVED",
+                    resolution: resolution
+                })
+            )
+            
+            (try! (execute-dispute-resolution dispute-id resolution))
+            (try! (distribute-jury-rewards dispute-id jury-reward))
+            (ok resolution)
+        )
+    )
+)
+
+(define-public (claim-jury-reward (dispute-id uint))
+    (let
+        ((dispute (unwrap! (map-get? loan-disputes { dispute-id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+         (jury-member (unwrap! (map-get? dispute-jury { dispute-id: dispute-id, juror: tx-sender }) ERR-NOT-JURY-MEMBER))
+         (jury-reward (/ (get fee-paid dispute) (var-get jury-size))))
+        
+        (asserts! (is-eq (get status dispute) "RESOLVED") ERR-DISPUTE-NOT-RESOLVED)
+        (asserts! (get has-voted jury-member) ERR-NOT-JURY-MEMBER)
+        (asserts! (not (get reward-claimed jury-member)) ERR-ALREADY-VOTED)
+        
+        (try! (as-contract (stx-transfer? jury-reward (as-contract tx-sender) tx-sender)))
+        
+        (map-set dispute-jury
+            { dispute-id: dispute-id, juror: tx-sender }
+            (merge jury-member { reward-claimed: true })
+        )
+        
+        (update-jury-reputation tx-sender jury-reward)
+        (ok true)
+    )
+)
+
+(define-private (get-active-dispute (loan-id uint))
+    (let
+        ((dispute-id (var-get dispute-counter)))
+        (fold check-dispute-for-loan (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) none)
+    )
+)
+
+(define-private (check-dispute-for-loan (id uint) (result (optional uint)))
+    (if (is-some result)
+        result
+        (let
+            ((dispute (map-get? loan-disputes { dispute-id: id })))
+            (if (is-some dispute)
+                (let ((d (unwrap-panic dispute)))
+                    (if (and (is-eq (get status d) "PENDING") (is-eq (get loan-id d) (var-get loan-counter)))
+                        (some id)
+                        none))
+                none)
+        )
+    )
+)
+
+(define-private (select-jury-for-dispute (dispute-id uint))
+    (begin
+        (map-set dispute-jury { dispute-id: dispute-id, juror: CONTRACT-OWNER } 
+            { has-voted: false, vote: "NONE", reward-claimed: false })
+        (map-set dispute-jury { dispute-id: dispute-id, juror: (as-contract tx-sender) } 
+            { has-voted: false, vote: "NONE", reward-claimed: false })
+        (map-set dispute-jury { dispute-id: dispute-id, juror: tx-sender } 
+            { has-voted: false, vote: "NONE", reward-claimed: false })
+        (ok true)
+    )
+)
+
+(define-private (execute-dispute-resolution (dispute-id uint) (resolution (string-ascii 20)))
+    (let
+        ((dispute (unwrap! (map-get? loan-disputes { dispute-id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+         (loan (unwrap! (map-get? loans { loan-id: (get loan-id dispute) }) ERR-LOAN-NOT-FOUND)))
+        
+        (if (is-eq resolution "FAVOR_INITIATOR")
+            (begin
+                (if (is-eq (get dispute-type dispute) "PAYMENT_DISPUTE")
+                    (try! (as-contract (stx-transfer? (/ (get collateral loan) u2) (as-contract tx-sender) (get initiator dispute))))
+                    true)
+                (if (is-eq (get dispute-type dispute) "COLLATERAL_DISPUTE")
+                    (try! (as-contract (stx-transfer? (get collateral loan) (as-contract tx-sender) (get initiator dispute))))
+                    true)
+                (ok true))
+            (begin
+                (if (is-eq (get dispute-type dispute) "PAYMENT_DISPUTE")
+                    (try! (as-contract (stx-transfer? (/ (get collateral loan) u2) (as-contract tx-sender) (get respondent dispute))))
+                    true)
+                (if (is-eq (get dispute-type dispute) "COLLATERAL_DISPUTE")
+                    (try! (as-contract (stx-transfer? (get collateral loan) (as-contract tx-sender) (get respondent dispute))))
+                    true)
+                (ok true))
+        )
+    )
+)
+
+(define-private (distribute-jury-rewards (dispute-id uint) (reward uint))
+    (begin
+        (try! (as-contract (stx-transfer? reward (as-contract tx-sender) CONTRACT-OWNER)))
+        (ok true)
+    )
+)
+
+(define-private (update-jury-reputation (juror principal) (reward uint))
+    (let
+        ((current-stats (default-to
+            { disputes-judged: u0, reputation-score: u0, total-rewards: u0, is-active: true }
+            (map-get? jury-pool { juror: juror }))))
+        
+        (map-set jury-pool
+            { juror: juror }
+            {
+                disputes-judged: (+ (get disputes-judged current-stats) u1),
+                reputation-score: (+ (get reputation-score current-stats) u5),
+                total-rewards: (+ (get total-rewards current-stats) reward),
+                is-active: (get is-active current-stats)
+            }
+        )
+        true
+    )
+)
+
+(define-public (set-dispute-parameters (fee uint) (period uint) (size uint) (min-credit uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set dispute-fee fee)
+        (var-set voting-period period)
+        (var-set jury-size size)
+        (var-set min-jury-credit min-credit)
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? loan-disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-jury-member (dispute-id uint) (juror principal))
+    (map-get? dispute-jury { dispute-id: dispute-id, juror: juror })
+)
+
+(define-read-only (get-jury-stats (juror principal))
+    (map-get? jury-pool { juror: juror })
+)
+
+(define-read-only (get-dispute-parameters)
+    {
+        fee: (var-get dispute-fee),
+        voting-period: (var-get voting-period),
+        jury-size: (var-get jury-size),
+        min-jury-credit: (var-get min-jury-credit)
+    }
+)
