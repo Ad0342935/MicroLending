@@ -653,6 +653,11 @@
     (if (< a b) a b)
 )
 
+;; Helper function for max
+(define-private (max (a uint) (b uint))
+    (if (> a b) a b)
+)
+
 (define-public (liquidate-collateral (loan-id uint))
     (let
         ((loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
@@ -1122,3 +1127,371 @@
         min-jury-credit: (var-get min-jury-credit)
     }
 )
+
+;; Dynamic Interest Rate System
+(define-constant ERR-RATE-CALCULATION-FAILED (err u120))
+(define-constant ERR-INVALID-RISK-FACTOR (err u121))
+(define-constant ERR-MARKET-DATA-STALE (err u122))
+
+;; Rate adjustment parameters
+(define-data-var base-interest-rate uint u500) ;; 5% base rate
+(define-data-var max-interest-rate uint u2000) ;; 20% maximum rate
+(define-data-var min-interest-rate uint u100) ;; 1% minimum rate
+(define-data-var rate-adjustment-factor uint u10) ;; 0.1% adjustment increments
+(define-data-var market-update-interval uint u144) ;; Update every 144 blocks (~24 hours)
+(define-data-var liquidity-threshold uint u100000000) ;; 100 STX threshold for rate adjustments
+
+;; Market condition tracking
+(define-map market-conditions
+    { period: uint }
+    {
+        total-loans-requested: uint,
+        total-loans-funded: uint,
+        average-credit-score: uint,
+        platform-liquidity: uint,
+        default-rate: uint,
+        timestamp: uint,
+        rate-adjustment: int
+    }
+)
+
+;; Individual borrower risk profiles
+(define-map borrower-risk-profiles
+    { borrower: principal }
+    {
+        risk-score: uint,
+        loan-history-score: uint,
+        collateral-ratio-avg: uint,
+        payment-reliability: uint,
+        last-updated: uint,
+        recommended-rate: uint
+    }
+)
+
+;; Historical interest rates
+(define-map interest-rate-history
+    { rate-id: uint }
+    {
+        period: uint,
+        base-rate: uint,
+        market-rate: uint,
+        risk-premium: uint,
+        liquidity-bonus: uint,
+        final-rate: uint,
+        timestamp: uint
+    }
+)
+
+;; Rate calculation engine
+(define-map rate-calculation-cache
+    { borrower: principal, loan-type: uint }
+    {
+        calculated-rate: uint,
+        risk-adjustment: uint,
+        market-adjustment: uint,
+        liquidity-adjustment: uint,
+        cache-timestamp: uint
+    }
+)
+
+(define-data-var market-period-counter uint u0)
+(define-data-var rate-history-counter uint u0)
+
+;; Calculate dynamic interest rate for a borrower
+(define-public (calculate-dynamic-rate (borrower principal) (loan-amount uint) (collateral uint))
+    (let
+        ((current-period (var-get market-period-counter))
+         (borrower-risk (get-borrower-risk-score borrower))
+         (market-data (get-current-market-conditions))
+         (liquidity-factor (calculate-liquidity-factor loan-amount))
+         (collateral-factor (calculate-collateral-factor collateral loan-amount)))
+        
+        ;; Base rate calculation
+        (let
+            ((base-rate (var-get base-interest-rate))
+             (risk-premium (calculate-risk-premium borrower-risk))
+             (market-adjustment (calculate-market-adjustment market-data))
+             (liquidity-adjustment (calculate-liquidity-adjustment liquidity-factor))
+             (collateral-discount (calculate-collateral-discount collateral-factor)))
+            
+            (let
+                ((calculated-rate (+ base-rate risk-premium market-adjustment liquidity-adjustment))
+                 (final-rate (- calculated-rate collateral-discount)))
+                
+                ;; Ensure rate is within bounds
+                (let
+                    ((bounded-rate (min (max final-rate (var-get min-interest-rate)) (var-get max-interest-rate))))
+                    
+                    ;; Cache the calculation
+                    (map-set rate-calculation-cache
+                        { borrower: borrower, loan-type: u1 }
+                        {
+                            calculated-rate: bounded-rate,
+                            risk-adjustment: risk-premium,
+                            market-adjustment: market-adjustment,
+                            liquidity-adjustment: liquidity-adjustment,
+                            cache-timestamp: stacks-block-height
+                        }
+                    )
+                    
+                    (ok bounded-rate)
+                )
+            )
+        )
+    )
+)
+
+;; Update borrower risk profile
+(define-public (update-borrower-risk-profile (borrower principal))
+    (let
+        ((credit-data (default-to
+            { score: u0, loans-taken: u0, loans-repaid: u0 }
+            (map-get? user-credit-scores { user: borrower })))
+         (loan-history (get-borrower-loan-history borrower))
+         (payment-record (calculate-payment-reliability borrower)))
+        
+        (let
+            ((risk-score (calculate-comprehensive-risk-score credit-data loan-history payment-record))
+             (collateral-avg (calculate-average-collateral-ratio borrower))
+             (recommended-rate (+ (var-get base-interest-rate) (/ (* risk-score u10) u100))))
+            
+            (map-set borrower-risk-profiles
+                { borrower: borrower }
+                {
+                    risk-score: risk-score,
+                    loan-history-score: (get loans-repaid credit-data),
+                    collateral-ratio-avg: collateral-avg,
+                    payment-reliability: payment-record,
+                    last-updated: stacks-block-height,
+                    recommended-rate: recommended-rate
+                }
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Update market conditions
+(define-public (update-market-conditions)
+    (let
+        ((current-period (+ (var-get market-period-counter) u1))
+         (market-stats (analyze-current-market))
+         (platform-liquidity (get-platform-total-liquidity))
+         (default-rate (calculate-platform-default-rate)))
+        
+        (map-set market-conditions
+            { period: current-period }
+            {
+                total-loans-requested: (get total-requested market-stats),
+                total-loans-funded: (get total-funded market-stats),
+                average-credit-score: (get avg-credit market-stats),
+                platform-liquidity: platform-liquidity,
+                default-rate: default-rate,
+                timestamp: stacks-block-height,
+                rate-adjustment: (calculate-market-rate-adjustment market-stats)
+            }
+        )
+        
+        (var-set market-period-counter current-period)
+        (ok current-period)
+    )
+)
+
+;; Record interest rate decision
+(define-public (record-rate-decision (borrower principal) (final-rate uint) (loan-id uint))
+    (let
+        ((rate-id (+ (var-get rate-history-counter) u1))
+         (cached-calc (map-get? rate-calculation-cache { borrower: borrower, loan-type: u1 }))
+         (current-period (var-get market-period-counter)))
+        
+        (map-set interest-rate-history
+            { rate-id: rate-id }
+            {
+                period: current-period,
+                base-rate: (var-get base-interest-rate),
+                market-rate: final-rate,
+                risk-premium: (default-to u0 (get risk-adjustment cached-calc)),
+                liquidity-bonus: (default-to u0 (get liquidity-adjustment cached-calc)),
+                final-rate: final-rate,
+                timestamp: stacks-block-height
+            }
+        )
+        
+        (var-set rate-history-counter rate-id)
+        (ok rate-id)
+    )
+)
+
+;; Private helper functions
+
+(define-private (get-borrower-risk-score (borrower principal))
+    (let
+        ((risk-profile (map-get? borrower-risk-profiles { borrower: borrower })))
+        (default-to u500 (get risk-score risk-profile)) ;; Default medium risk
+    )
+)
+
+(define-private (get-current-market-conditions)
+    (let
+        ((current-period (var-get market-period-counter)))
+        (default-to
+            { total-loans-requested: u0, total-loans-funded: u0, average-credit-score: u0, 
+              platform-liquidity: u0, default-rate: u0, timestamp: u0, rate-adjustment: 0 }
+            (map-get? market-conditions { period: current-period }))
+    )
+)
+
+(define-private (calculate-liquidity-factor (loan-amount uint))
+    (let
+        ((platform-liquidity (get-platform-total-liquidity)))
+        (if (> platform-liquidity (var-get liquidity-threshold))
+            u100 ;; High liquidity
+            (if (> platform-liquidity (/ (var-get liquidity-threshold) u2))
+                u75  ;; Medium liquidity
+                u50  ;; Low liquidity
+            )
+        )
+    )
+)
+
+(define-private (calculate-collateral-factor (collateral uint) (loan-amount uint))
+    (if (> loan-amount u0)
+        (/ (* collateral u100) loan-amount) ;; Collateral ratio as percentage
+        u0
+    )
+)
+
+(define-private (calculate-risk-premium (risk-score uint))
+    (if (> risk-score u800)
+        u0      ;; Very low risk - no premium
+        (if (> risk-score u600)
+            u50     ;; Low risk - 0.5% premium
+            (if (> risk-score u400)
+                u100    ;; Medium risk - 1% premium
+                u200    ;; High risk - 2% premium
+            )
+        )
+    )
+)
+
+(define-private (calculate-market-adjustment (market-data (tuple (total-loans-requested uint) (total-loans-funded uint) (average-credit-score uint) (platform-liquidity uint) (default-rate uint) (timestamp uint) (rate-adjustment int))))
+    (let
+        ((demand-ratio (if (> (get total-loans-requested market-data) u0)
+                         (/ (* (get total-loans-funded market-data) u100) (get total-loans-requested market-data))
+                         u50)))
+        (if (> demand-ratio u80)
+            u50  ;; High demand - increase rate by 0.5%
+            (if (< demand-ratio u40)
+                (- u0 u25) ;; Low demand - decrease rate by 0.25%
+                u0  ;; Balanced demand - no adjustment
+            )
+        )
+    )
+)
+
+(define-private (calculate-liquidity-adjustment (liquidity-factor uint))
+    (if (> liquidity-factor u90)
+        (- u0 u25) ;; High liquidity bonus - reduce rate by 0.25%
+        (if (< liquidity-factor u60)
+            u25     ;; Low liquidity penalty - increase rate by 0.25%
+            u0      ;; Normal liquidity - no adjustment
+        )
+    )
+)
+
+(define-private (calculate-collateral-discount (collateral-factor uint))
+    (if (> collateral-factor u200)
+        u50     ;; High collateral - 0.5% discount
+        (if (> collateral-factor u150)
+            u25     ;; Good collateral - 0.25% discount
+            u0      ;; Standard collateral - no discount
+        )
+    )
+)
+
+(define-private (get-borrower-loan-history (borrower principal))
+    { loans-taken: u0, loans-repaid: u0, avg-repayment-time: u0 }
+)
+
+(define-private (calculate-payment-reliability (borrower principal))
+    (let
+        ((credit-data (default-to
+            { score: u0, loans-taken: u0, loans-repaid: u0 }
+            (map-get? user-credit-scores { user: borrower }))))
+        (if (> (get loans-taken credit-data) u0)
+            (/ (* (get loans-repaid credit-data) u100) (get loans-taken credit-data))
+            u50 ;; Default reliability for new borrowers
+        )
+    )
+)
+
+(define-private (calculate-comprehensive-risk-score (credit-data (tuple (score uint) (loans-taken uint) (loans-repaid uint))) (loan-history (tuple (loans-taken uint) (loans-repaid uint) (avg-repayment-time uint))) (payment-reliability uint))
+    (let
+        ((credit-weight (/ (* (get score credit-data) u40) u100))
+         (history-weight (/ (* payment-reliability u30) u100))
+         (reliability-weight (/ (* payment-reliability u30) u100)))
+        (+ credit-weight history-weight reliability-weight)
+    )
+)
+
+(define-private (calculate-average-collateral-ratio (borrower principal))
+    u150 ;; Simplified - would calculate from loan history
+)
+
+(define-private (analyze-current-market)
+    { total-requested: u10, total-funded: u8, avg-credit: u500 }
+)
+
+(define-private (get-platform-total-liquidity)
+    (get-platform-treasury-balance)
+)
+
+(define-private (calculate-platform-default-rate)
+    u5 ;; Simplified - would calculate from actual defaults
+)
+
+(define-private (calculate-market-rate-adjustment (market-stats (tuple (total-requested uint) (total-funded uint) (avg-credit uint))))
+    0 ;; Simplified - would calculate based on market trends
+)
+
+;; Admin functions
+(define-public (set-rate-parameters (base-rate uint) (max-rate uint) (min-rate uint) (adjustment-factor uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (<= min-rate base-rate) ERR-INVALID-AMOUNT)
+        (asserts! (<= base-rate max-rate) ERR-INVALID-AMOUNT)
+        
+        (var-set base-interest-rate base-rate)
+        (var-set max-interest-rate max-rate)
+        (var-set min-interest-rate min-rate)
+        (var-set rate-adjustment-factor adjustment-factor)
+        (ok true)
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-borrower-recommended-rate (borrower principal))
+    (let
+        ((risk-profile (map-get? borrower-risk-profiles { borrower: borrower })))
+        (default-to (var-get base-interest-rate) (get recommended-rate risk-profile))
+    )
+)
+
+(define-read-only (get-market-conditions-for-period (period uint))
+    (map-get? market-conditions { period: period })
+)
+
+(define-read-only (get-rate-history (rate-id uint))
+    (map-get? interest-rate-history { rate-id: rate-id })
+)
+
+(define-read-only (get-current-rate-parameters)
+    {
+        base-rate: (var-get base-interest-rate),
+        max-rate: (var-get max-interest-rate),
+        min-rate: (var-get min-interest-rate),
+        adjustment-factor: (var-get rate-adjustment-factor),
+        market-period: (var-get market-period-counter)
+    }
+)
+
