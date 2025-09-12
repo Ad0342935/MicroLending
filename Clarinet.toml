@@ -9,6 +9,14 @@ requirements = []
 path = 'contracts/MicroLending.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.LoanPortfolioAnalytics]
+path = 'contracts/LoanPortfolioAnalytics.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.SocialImpactScoring]
+path = 'contracts/SocialImpactScoring.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
